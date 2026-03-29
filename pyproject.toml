@@ -1,0 +1,13 @@
+[project]
+name = "house2"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.42.78",
+    "duckdb>=1.5.1",
+    "pandas>=2.3.3",
+    "plotly>=6.6.0",
+    "requests>=2.33.0",
+    "streamlit>=1.55.0",
+]
