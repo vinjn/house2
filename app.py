@@ -11,6 +11,9 @@ import boto3.s3.transfer as s3transfer
 from botocore import UNSIGNED
 from botocore.config import Config
 import duckdb
+import numpy as np
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import PolynomialFeatures
 
 st.set_page_config(page_title="Silicon Valley Housing Trends", layout="wide")
 
@@ -333,6 +336,128 @@ if heat_data:
         margin=dict(l=120),
     )
     st.plotly_chart(fig3, use_container_width=True)
+
+# ── Price Prediction ──────────────────────────────────────────────────────────
+st.divider()
+st.subheader("Price Prediction (next 12 months)")
+st.caption("Ridge regression on time trend + month seasonality, trained on all available history for each city.")
+
+pred_horizon = st.slider("Forecast horizon (months)", min_value=3, max_value=24, value=12, step=3)
+
+pred_data = sv[
+    sv["city"].isin(selected_cities)
+    & sv["median_sale_price"].notna()
+].copy()
+if sel_type != "All":
+    pred_data = pred_data[pred_data["property_type"] == sel_type]
+
+pred_data = pred_data.sort_values("period_begin")
+
+
+def build_features(dates: pd.Series) -> np.ndarray:
+    """Month index + sin/cos seasonality features."""
+    t = (dates - dates.min()).dt.days.values.reshape(-1, 1)
+    month = dates.dt.month.values
+    sin_m = np.sin(2 * np.pi * month / 12).reshape(-1, 1)
+    cos_m = np.cos(2 * np.pi * month / 12).reshape(-1, 1)
+    return np.hstack([t, t**2, sin_m, cos_m])
+
+
+fig_pred = go.Figure()
+city_forecasts = {}
+
+for city_name, grp in pred_data.groupby("city"):
+    monthly = (
+        grp.groupby("period_begin")["median_sale_price"]
+        .median()
+        .reset_index()
+        .sort_values("period_begin")
+    )
+    if len(monthly) < 12:
+        continue
+
+    X = build_features(monthly["period_begin"])
+    y = monthly["median_sale_price"].values
+
+    model = Ridge(alpha=1.0)
+    model.fit(X, y)
+    y_pred_train = model.predict(X)
+    residuals = y - y_pred_train
+    sigma = residuals.std()
+
+    # Future dates
+    last_date = monthly["period_begin"].max()
+    future_dates = pd.date_range(
+        start=last_date + pd.DateOffset(months=1),
+        periods=pred_horizon,
+        freq="MS",
+    )
+    all_dates = pd.concat(
+        [monthly["period_begin"], pd.Series(future_dates)], ignore_index=True
+    )
+    ref_date = monthly["period_begin"].min()
+    all_t = (all_dates - ref_date).dt.days.values.reshape(-1, 1)
+    month_all = all_dates.dt.month.values
+    sin_all = np.sin(2 * np.pi * month_all / 12).reshape(-1, 1)
+    cos_all = np.cos(2 * np.pi * month_all / 12).reshape(-1, 1)
+    X_all = np.hstack([all_t, all_t**2, sin_all, cos_all])
+
+    preds = model.predict(X_all)
+    n_hist = len(monthly)
+
+    # Historical fitted line
+    fig_pred.add_trace(go.Scatter(
+        x=all_dates[:n_hist], y=preds[:n_hist],
+        mode="lines", line=dict(width=1, dash="dot"),
+        name=f"{city_name} (fit)", showlegend=False,
+    ))
+    # Actual historical
+    fig_pred.add_trace(go.Scatter(
+        x=monthly["period_begin"], y=y,
+        mode="lines+markers", name=city_name,
+        marker=dict(size=3),
+    ))
+    # Forecast
+    fig_pred.add_trace(go.Scatter(
+        x=all_dates[n_hist - 1:], y=preds[n_hist - 1:],
+        mode="lines+markers", line=dict(dash="dash"),
+        name=f"{city_name} forecast", showlegend=True,
+    ))
+    # Confidence band
+    fig_pred.add_trace(go.Scatter(
+        x=list(all_dates[n_hist - 1:]) + list(all_dates[n_hist - 1:][::-1]),
+        y=list(preds[n_hist - 1:] + 1.96 * sigma) + list((preds[n_hist - 1:] - 1.96 * sigma)[::-1]),
+        fill="toself", opacity=0.15, line=dict(width=0),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    city_forecasts[city_name] = {
+        "date": future_dates[-1].strftime("%Y-%m"),
+        "price": int(preds[-1]),
+        "low": int(preds[-1] - 1.96 * sigma),
+        "high": int(preds[-1] + 1.96 * sigma),
+    }
+
+fig_pred.update_layout(
+    xaxis_title="Date",
+    yaxis_title="Median Sale Price ($)",
+    yaxis_tickprefix="$",
+    yaxis_tickformat=",.0f",
+    template="plotly_white",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    height=500,
+)
+st.plotly_chart(fig_pred, use_container_width=True)
+
+if city_forecasts:
+    st.subheader(f"Predicted median price in {pred_horizon} months")
+    fcols = st.columns(min(len(city_forecasts), 5))
+    for i, (city_name, fc) in enumerate(sorted(city_forecasts.items())):
+        fcols[i % len(fcols)].metric(
+            label=city_name,
+            value=f"${fc['price']:,}",
+            delta=f"95% CI: ${fc['low']:,} – ${fc['high']:,}",
+        )
 
 # ── Raw data expander ─────────────────────────────────────────────────────────
 with st.expander("Raw data"):
